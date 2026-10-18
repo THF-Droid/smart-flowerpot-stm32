@@ -1,0 +1,40 @@
+# Keil MDK 编译产物
+MDK-ARM/*/
+*.o
+*.d
+*.crf
+*.axf
+*.lst
+*.map
+*.dep
+*.iex
+*.htm
+*.lnp
+*.sct
+*.hex
+*.bin
+*.elf
+
+# STM32CubeMX 备份
+*.bak
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.idea/
+
+# Arduino
+build/
+
+# 系统文件
+Thumbs.db
+desktop.ini
+~$*
+*.tmp
+
+# 本地配置（含真实凭据，勿提交）
+config.local.*
+secrets.*
+*.uvguix.*

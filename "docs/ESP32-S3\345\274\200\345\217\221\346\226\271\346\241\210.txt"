@@ -1,0 +1,539 @@
+================================================================================
+  ESP32-S3 上位机代码开发方案
+  智能花盆系统 — STM32 ↔ ESP32-S3 ↔ OneNet 云平台
+  版本: 1.0
+================================================================================
+
+目录
+----
+一、硬件接线
+二、开发环境搭建
+三、OneNet 云平台配置
+四、ESP32-S3 程序架构
+五、完整代码（Arduino IDE）
+六、编译与烧录
+七、联调测试步骤
+八、数据流与命令流汇总
+
+
+================================================================================
+一、硬件接线
+================================================================================
+
+  STM32 (F4)          ESP32-S3 开发板
+  ─────────────────   ────────────────
+  PC6  (USART6_TX) →  GPIO17 (RX2)
+  PC7  (USART6_RX) ←  GPIO16 (TX2)
+  GND                ↔  GND
+
+  说明：
+  - 均为 3.3V 电平，直连即可，无需电平转换
+  - 使用 ESP32-S3 的 UART2（硬件串口2），避免与 USB 调试串口 UART0 冲突
+  - UART0 用于串口监视器调试输出
+
+
+================================================================================
+二、开发环境搭建
+================================================================================
+
+  推荐使用 Arduino IDE，步骤：
+
+  1. 下载安装 Arduino IDE 2.x：https://www.arduino.cc/en/software
+
+  2. 添加 ESP32 开发板支持：
+     - 文件 → 首选项 → 附加开发板管理器网址，填入：
+       https://espressif.github.io/arduino-esp32/package_esp32_index.json
+     - 工具 → 开发板 → 开发板管理器 → 搜索 "esp32" → 安装 "esp32 by Espressif"
+
+  3. 安装所需库（工具 → 管理库）：
+     - ArduinoJson (by Benoit Blanchon) — JSON 解析
+     - PubSubClient (by Nick O'Leary)      — MQTT 客户端
+
+  4. 选择开发板：
+     - 工具 → 开发板 → ESP32 → ESP32S3 Dev Module
+     - USB CDC On Boot: Enabled
+     - Flash Size: 16MB
+     - Partition Scheme: Default
+
+
+================================================================================
+三、OneNet 云平台配置
+================================================================================
+
+  3.1 注册与创建产品
+  ─────────────────
+  1. 登录 OneNet Studio：https://open.iot.10086.cn/studio/
+  2. 控制台 → 全部产品 → 创建产品
+     - 产品名称：智能花盆
+     - 协议类型：MQTT
+     - 联网方式：Wi-Fi
+     - 数据格式：JSON
+  3. 记录产品 ID (product_id)，例如：ABC123DEF4
+
+  3.2 创建设备
+  ───────────
+  1. 进入该产品 → 设备管理 → 添加设备
+     - 设备名称：flowerpot_01
+  4. 记录设备密钥 (device_key)，例如：key=xxx...
+
+  3.3 定义物模型（数据点）
+  ───────────────────────
+  在产品详情 → 物模型 → 添加自定义功能点：
+
+  ┌──────────┬────────┬──────────┬──────┬─────────────┐
+  │ 功能名称  │ 标识符  │ 数据类型  │ 单位  │ 说明         │
+  ├──────────┼────────┼──────────┼──────┼─────────────┤
+  │ 温度     │ temp   │ float    │ ℃   │ 空气温度      │
+  │ 湿度     │ humi   │ float    │ %RH  │ 空气湿度      │
+  │ 土壤湿度  │ soil   │ int      │ %    │ 土壤含水量     │
+  │ 光照强度  │ light  │ float    │ lux  │ 环境光照      │
+  │ AI状态   │ ai_status│ int    │ —    │ 0健康/1缺光/2温异/3缺水 │
+  │ 风扇状态  │ fan    │ bool     │ —    │ true=开       │
+  │ 补光灯   │ bulb   │ bool     │ —    │ true=开       │
+  │ 水泵状态  │ pump   │ bool     │ —    │ true=开       │
+  │ 舵机角度  │ servo  │ int      │ °    │ 0/90/180     │
+  │ 模式     │ mode   │ int      │ —    │ 0自动/1手动   │
+  └──────────┴────────┴──────────┴──────┴─────────────┘
+
+  3.4 记录 MQTT 连接参数
+  ──────────────────────
+  ┌─────────────────┬──────────────────────────────────────┐
+  │ 参数             │ 值                                   │
+  ├─────────────────┼──────────────────────────────────────┤
+  │ 服务器地址       │ mqtts.heclouds.com                   │
+  │ 端口             │ 1883                                 │
+  │ 客户端ID (用户名) │ {device_name}                        │
+  │ 用户名 (鉴权)     │ {product_id}                         │
+  │ 密码             │ {device_key}（创建设备时生成的密钥）    │
+  │ 发布主题         │ $sys/{product_id}/{device_name}/dp/post/json │
+  │ 订阅主题         │ $sys/{product_id}/{device_name}/cmd/request/+ │
+  │ 属性上报响应      │ $sys/{product_id}/{device_name}/dp/post/json/reply │
+  └─────────────────┴──────────────────────────────────────┘
+
+
+================================================================================
+四、ESP32-S3 程序架构
+================================================================================
+
+  多任务设计（FreeRTOS，Arduino 环境自动创建）：
+
+  ┌────────────────────────────────────────────────────┐
+  │                    loop() 主循环                    │
+  │  维持 MQTT 连接 + 定期调用 client.loop()            │
+  └───────────────┬────────────────────────────────────┘
+                  │
+  ┌───────────────┴────────────────────────────────────┐
+  │              Task: UART 接收（pin 中断）             │
+  │  RX2 (GPIO16) ← STM32 USART6_TX (PC6)              │
+  │  接收一行 JSON → 解析 → 更新全局传感器数据            │
+  │  等待 2秒 → 发布到 OneNet                           │
+  └────────────────────────────────────────────────────┘
+                  │
+  ┌───────────────┴────────────────────────────────────┐
+  │           Callback: MQTT 命令下发回调                │
+  │  OneNet → 解析 cmd 字段 → TX2 (GPIO17) → STM32     │
+  └────────────────────────────────────────────────────┘
+
+
+================================================================================
+五、完整代码（Arduino IDE）
+================================================================================
+
+// ============================================================
+// 文件名: smart_flowerpot_esp32s3.ino
+// 功能:   STM32 ↔ ESP32-S3 ↔ OneNet 云平台 数据桥接
+// ============================================================
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+
+// ─── WiFi 配置 ─────────────────────────────────────────────
+const char* WIFI_SSID     = "你的WiFi名称";
+const char* WIFI_PASSWORD = "你的WiFi密码";
+
+// ─── OneNet MQTT 配置 ─────────────────────────────────────
+const char* MQTT_SERVER   = "mqtts.heclouds.com";
+const int   MQTT_PORT     = 1883;
+const char* PRODUCT_ID    = "你的产品ID";       // 例如 "ABC123DEF4"
+const char* DEVICE_NAME   = "flowerpot_01";     // 设备名称
+const char* DEVICE_KEY    = "你的设备密钥";      // 创建设备时生成
+
+// ─── UART 引脚定义 ─────────────────────────────────────────
+#define STM32_RX_PIN   16   // ESP32-S3 RX2, 接 STM32 PC6(TX)
+#define STM32_TX_PIN   17   // ESP32-S3 TX2, 接 STM32 PC7(RX)
+
+// ─── 全局变量 ──────────────────────────────────────────────
+HardwareSerial stm32Serial(2);  // 使用硬件串口 UART2
+
+// 传感器数据（STM32 发来的最新值）
+float g_temp  = 0.0;
+float g_humi  = 0.0;
+int   g_soil  = 0;
+float g_light = 0.0;
+int   g_ai    = 0;
+bool  g_data_updated = false;   // 标记是否有新数据
+
+// MQTT 客户端
+WiFiClient    wifiClient;
+PubSubClient  mqttClient(wifiClient);
+
+// JSON 文档缓冲区
+StaticJsonDocument<512> jsonDoc;
+
+// 定时器
+unsigned long lastPublishTime = 0;
+const unsigned long PUBLISH_INTERVAL = 3000;  // 3秒上报一次
+
+
+// ============================================================
+// 函数: MQTT 消息回调（处理 OneNet 下发的命令）
+// ============================================================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    // 构造 JSON 解析
+    StaticJsonDocument<256> cmdDoc;
+    DeserializationError err = deserializeJson(cmdDoc, payload, length);
+    if (err) {
+        Serial.print("[MQTT] JSON解析失败: ");
+        Serial.println(err.c_str());
+        return;
+    }
+
+    // OneNet 命令下发格式: {"id":"xxx","version":"1.0","params":{"cmd":"ON"}}
+    // 或属性设置格式: {"id":"xxx","version":"1.0","params":{"fan":true}}
+    const char* cmd = cmdDoc["params"]["cmd"];
+    if (cmd != NULL && strlen(cmd) > 0) {
+        Serial.printf("[MQTT] 收到命令: %s\n", cmd);
+
+        // 转发给 STM32（追加换行符作为命令结束标志）
+        stm32Serial.println(cmd);
+        Serial.printf("[UART] 已转发命令到STM32: %s\n", cmd);
+    }
+
+    // 也可以处理属性设置的逐项控制
+    if (cmdDoc["params"].containsKey("fan")) {
+        bool fan_on = cmdDoc["params"]["fan"];
+        stm32Serial.println(fan_on ? "AF" : "AO");
+    }
+    if (cmdDoc["params"].containsKey("bulb")) {
+        bool bulb_on = cmdDoc["params"]["bulb"];
+        stm32Serial.println(bulb_on ? "BO" : "BF");
+    }
+    if (cmdDoc["params"].containsKey("pump")) {
+        bool pump_on = cmdDoc["params"]["pump"];
+        stm32Serial.println(pump_on ? "CO" : "CF");
+    }
+    if (cmdDoc["params"].containsKey("servo")) {
+        int angle = cmdDoc["params"]["servo"];
+        stm32Serial.printf("SERVO_%d\n", angle);
+    }
+}
+
+
+// ============================================================
+// 函数: 连接 MQTT（含自动重连）
+// ============================================================
+void connectMQTT() {
+    while (!mqttClient.connected()) {
+        Serial.print("[MQTT] 正在连接 OneNet...");
+
+        // OneNet MQTT 认证格式:
+        // ClientID = device_name
+        // Username = product_id
+        // Password = device_key
+        if (mqttClient.connect(DEVICE_NAME, PRODUCT_ID, DEVICE_KEY)) {
+            Serial.println(" 连接成功!");
+
+            // 订阅命令下发主题
+            String cmdTopic = String("$sys/") + PRODUCT_ID + "/" + DEVICE_NAME + "/cmd/request/+";
+            mqttClient.subscribe(cmdTopic.c_str());
+            Serial.printf("[MQTT] 已订阅: %s\n", cmdTopic.c_str());
+
+            // 订阅属性设置主题（OneNet Studio 的属性设置）
+            String propSetTopic = String("$sys/") + PRODUCT_ID + "/" + DEVICE_NAME + "/thing/property/set";
+            mqttClient.subscribe(propSetTopic.c_str());
+            Serial.printf("[MQTT] 已订阅: %s\n", propSetTopic.c_str());
+
+        } else {
+            Serial.printf(" 失败, rc=%d, 5秒后重试\n", mqttClient.state());
+            delay(5000);
+        }
+    }
+}
+
+
+// ============================================================
+// 函数: 上报传感器数据到 OneNet
+// ============================================================
+void publishSensorData() {
+    if (!mqttClient.connected()) return;
+
+    jsonDoc.clear();
+    JsonArray dpArray = jsonDoc.createNestedArray("dp");
+
+    // 温度
+    JsonObject dp_temp = dpArray.createNestedObject();
+    dp_temp["id"] = "temp";
+    dp_temp["v"]  = g_temp;
+
+    // 湿度
+    JsonObject dp_humi = dpArray.createNestedObject();
+    dp_humi["id"] = "humi";
+    dp_humi["v"]  = g_humi;
+
+    // 土壤湿度
+    JsonObject dp_soil = dpArray.createNestedObject();
+    dp_soil["id"] = "soil";
+    dp_soil["v"]  = g_soil;
+
+    // 光照强度
+    JsonObject dp_light = dpArray.createNestedObject();
+    dp_light["id"] = "light";
+    dp_light["v"]  = g_light;
+
+    // AI 状态
+    JsonObject dp_ai = dpArray.createNestedObject();
+    dp_ai["id"] = "ai_status";
+    dp_ai["v"]  = g_ai;
+
+    String payload;
+    serializeJson(jsonDoc, payload);
+
+    String pubTopic = String("$sys/") + PRODUCT_ID + "/" + DEVICE_NAME + "/dp/post/json";
+    if (mqttClient.publish(pubTopic.c_str(), payload.c_str())) {
+        Serial.printf("[Publish] 数据已上报: %s\n", payload.c_str());
+    } else {
+        Serial.println("[Publish] 上报失败!");
+    }
+}
+
+
+// ============================================================
+// 函数: 接收并解析 STM32 发来的 JSON 数据
+// ============================================================
+void readSTM32Data() {
+    if (!stm32Serial.available()) return;
+
+    String line = stm32Serial.readStringUntil('\n');
+    line.trim();  // 去除首尾空白和 \r
+
+    if (line.length() == 0) return;
+
+    // 解析 JSON: {"temp":25.3,"humi":60.5,"soil":45,"light":1200,"ai":0}
+    StaticJsonDocument<256> doc;
+    DeserializationError err = deserializeJson(doc, line);
+    if (err) {
+        Serial.printf("[UART] JSON解析失败: %s\n", err.c_str());
+        Serial.printf("[UART] 原始数据: %s\n", line.c_str());
+        return;
+    }
+
+    g_temp  = doc["temp"]  | 0.0f;
+    g_humi  = doc["humi"]  | 0.0f;
+    g_soil  = doc["soil"]  | 0;
+    g_light = doc["light"] | 0.0f;
+    g_ai    = doc["ai"]    | 0;
+    g_data_updated = true;
+
+    Serial.printf("[UART] 收到: T=%.1f℃ H=%.1f%% S=%d%% L=%.0flux AI=%d\n",
+                  g_temp, g_humi, g_soil, g_light, g_ai);
+}
+
+
+// ============================================================
+// 函数: 连接 WiFi
+// ============================================================
+void connectWiFi() {
+    Serial.printf("[WiFi] 正在连接 %s", WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    int retry = 0;
+    while (WiFi.status() != WL_CONNECTED && retry < 30) {
+        delay(1000);
+        Serial.print(".");
+        retry++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\n[WiFi] 连接成功!");
+        Serial.printf("[WiFi] IP地址: %s\n", WiFi.localIP().toString().c_str());
+    } else {
+        Serial.println("\n[WiFi] 连接失败，请检查SSID/密码");
+    }
+}
+
+
+// ============================================================
+// setup() — 初始化
+// ============================================================
+void setup() {
+    // 1. USB 串口（调试输出）
+    Serial.begin(115200);
+    delay(500);
+    Serial.println("\n========================================");
+    Serial.println("  智能花盆 ESP32-S3 数据桥接程序");
+    Serial.println("========================================");
+
+    // 2. 初始化 STM32 通信串口 UART2
+    stm32Serial.begin(115200, SERIAL_8N1, STM32_RX_PIN, STM32_TX_PIN);
+    Serial.println("[UART] STM32通信串口已初始化 (115200 8N1)");
+
+    // 3. 连接 WiFi
+    connectWiFi();
+
+    // 4. 配置 MQTT
+    mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+    mqttClient.setCallback(mqttCallback);
+    mqttClient.setKeepAlive(60);       // 心跳间隔 60 秒
+    mqttClient.setSocketTimeout(10);   // Socket 超时 10 秒
+
+    // 5. 连接 OneNet MQTT
+    connectMQTT();
+
+    Serial.println("[System] 初始化完成，开始运行...\n");
+}
+
+
+// ============================================================
+// loop() — 主循环
+// ============================================================
+void loop() {
+    // 1. 检查 WiFi 连接
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[WiFi] 连接断开，尝试重连...");
+        connectWiFi();
+    }
+
+    // 2. 检查 MQTT 连接
+    if (!mqttClient.connected()) {
+        connectMQTT();
+    }
+    mqttClient.loop();  // 必须定期调用以维持 MQTT 连接和处理回调
+
+    // 3. 读取 STM32 发来的传感器数据
+    readSTM32Data();
+
+    // 4. 定时上报（有数据就上报，与 STM32 2秒采集周期错开）
+    unsigned long now = millis();
+    if (now - lastPublishTime >= PUBLISH_INTERVAL) {
+        lastPublishTime = now;
+        publishSensorData();
+    }
+
+    delay(10);  // 让出 CPU，避免看门狗超时
+}
+
+
+================================================================================
+六、编译与烧录
+================================================================================
+
+  1. 将上述代码复制到 Arduino IDE 中，保存为 smart_flowerpot_esp32s3.ino
+
+  2. 修改以下配置为你自己的值：
+     ┌────────────────┬─────────────────────────────┐
+     │ 变量            │ 修改为                       │
+     ├────────────────┼─────────────────────────────┤
+     │ WIFI_SSID      │ 你的 WiFi 名称               │
+     │ WIFI_PASSWORD  │ 你的 WiFi 密码               │
+     │ PRODUCT_ID     │ OneNet 产品 ID               │
+     │ DEVICE_NAME    │ OneNet 设备名称              │
+     │ DEVICE_KEY     │ OneNet 设备密钥              │
+     └────────────────┴─────────────────────────────┘
+
+  3. 用 USB 线连接 ESP32-S3 开发板的 USB 口到电脑
+
+  4. 选择端口（工具 → 端口 → 选择 ESP32-S3 对应的 COM 口）
+
+  5. 点击"上传"按钮，等待编译和烧录完成
+
+  6. 打开串口监视器（工具 → 串口监视器，波特率 115200），观察运行日志
+
+
+================================================================================
+七、联调测试步骤
+================================================================================
+
+  第一步：硬件检查
+  ────────────────
+  1. 确认 STM32 PC6 → ESP32 GPIO16, STM32 PC7 → ESP32 GPIO17, GND ↔ GND
+  2. STM32 和 ESP32 分别上电
+
+  第二步：STM32 端验证
+  ───────────────────
+  1. 用蓝牙/电脑串口助手连接 STM32 USART1，能看到周期性 JSON 输出：
+     {"temp":25.3,"humi":60.5,"soil":45,"light":1200,"ai":0}
+  2. 确认 JSON 格式正确，每 2 秒一条
+
+  第三步：ESP32 端验证
+  ───────────────────
+  1. 打开 ESP32 串口监视器，应看到：
+     [WiFi] 正在连接... → 连接成功! → IP: 192.168.x.x
+     [MQTT] 正在连接 OneNet... → 连接成功!
+     [UART] 收到: T=25.3℃ H=60.5% S=45% L=1200lux AI=0
+     [Publish] 数据已上报: ...
+
+  第四步：OneNet 端验证
+  ────────────────────
+  1. 登录 OneNet Studio → 设备管理 → flowerpot_01 → 数据查看
+  2. 应能看到温度、湿度、土壤湿度、光照、AI状态等实时数据刷新
+
+  第五步：命令下发测试
+  ───────────────────
+  1. OneNet Studio → 设备管理 → flowerpot_01 → 命令下发
+  2. 下发 JSON: {"cmd":"ON"}
+  3. STM32 应进入手动模式，串口监视器显示 "CMD_OK: ON"
+  4. 测试其他命令: OFF / AF / AO / BO / BF / CO / CF / SERVO_0 / SERVO_90 / SERVO_180 / BUZZER
+
+
+================================================================================
+八、数据流与命令流汇总
+================================================================================
+
+  8.1 数据上行（STM32 → ESP32-S3 → OneNet）
+  ──────────────────────────────────────────
+
+  STM32 每 2 秒通过 USART6 发送：
+  {"temp":25.3,"humi":60.5,"soil":45,"light":1200,"ai":0}
+
+  ESP32-S3 收到后解析，每 3 秒上报到 OneNet：
+  Topic: $sys/{product_id}/{device_name}/dp/post/json
+  Payload: {"dp":[{"id":"temp","v":25.3},{"id":"humi","v":60.5},...]}
+
+
+  8.2 命令下行（OneNet → ESP32-S3 → STM32）
+  ──────────────────────────────────────────
+
+  OneNet 下发命令 →
+  Topic: $sys/{product_id}/{device_name}/cmd/request/{cmdid}
+  Payload: {"id":"xxx","version":"1.0","params":{"cmd":"ON"}}
+
+  ESP32-S3 解析 cmd 字段 → 通过 UART2 发送文本命令到 STM32 →
+  STM32 的 parse_command() 处理，返回 "CMD_OK: ON"
+
+
+  8.3 STM32 支持的命令全集
+  ────────────────────────
+
+  ┌────────────┬────────────────────────────────┐
+  │ 命令       │ 功能                            │
+  ├────────────┼────────────────────────────────┤
+  │ ON         │ 进入手动模式                     │
+  │ OFF        │ 恢复自动模式 + 复位所有外设       │
+  │ AF         │ 风扇开 (AirFan)                  │
+  │ AO         │ 风扇关                           │
+  │ BO         │ 补光灯开 (PA5, 光照不足时补光)    │
+  │ BF         │ 补光灯关                         │
+  │ CO         │ 水泵开 (PA7, 土壤干燥时浇水)      │
+  │ CF         │ 水泵关                           │
+  │ SERVO_0    │ 遮阳帘全开 (0°, 光照正常)        │
+  │ SERVO_90   │ 遮阳帘半开 (90°, 中等光照)        │
+  │ SERVO_180  │ 遮阳帘全关 (180°, 光照过强)       │
+  │ BUZZER     │ 蜂鸣器测试（响 3 声）             │
+  │ BZOFF      │ 紧急静音（30 秒静音）             │
+  └────────────┴────────────────────────────────┘
+
+================================================================================
+                          END
+================================================================================
+（内容由AI生成，仅供参考）

@@ -1,0 +1,237 @@
+================================================================
+  智能花盆云监控系统 —— STM32 模块搭建流程参考
+  （用于学年设计实验报告）
+================================================================
+
+一、项目概述
+------------------------------------------------------------------------
+本项目基于 STM32F4 微控制器，构建智能花盆云监控系统的嵌入式端。
+系统通过多路传感器采集环境数据，利用随机森林 AI 模型进行四分类诊断，
+并通过 ESP32 上传至云端，同时支持远程手动控制执行机构。
+
+运行环境：
+  - 主控芯片   ：STM32F401RCTx（Nucleo-F401RE 开发板）
+  - 开发工具   ：STM32CubeIDE + STM32CubeMX
+  - 操作系统   ：FreeRTOS（CMSIS-OS v1 接口）
+  - 编程语言   ：C（HAL 库）
+
+
+二、硬件资源分配与引脚定义
+------------------------------------------------------------------------
+【传感器 / 输入设备】
+  DHT11 温湿度传感器     → PB5  （GPIO 单总线协议，软件模拟时序）
+  光照传感器（光敏电阻）  → PA0  （ADC1_CH0，模拟量输入）
+  土壤湿度传感器         → PA6  （ADC1_CH6，模拟量输入）
+  按键 OB0               → PB0  （GPIO 输入，内部上拉，低电平有效）
+
+【显示设备】
+  OLED 显示屏（0.96" I2C）→ PB6（SCL）/ PB7（SDA）（GPIO 软件 I2C）
+    - 4 页切换：温湿度 / 土壤湿度 / 光照强度 / AI 诊断结果
+
+【执行机构（均为低电平触发）】
+  SG90 舵机（遮阳）      → PA8  （TIM1_CH1 PWM，50Hz，500~2500µs 脉宽）
+  蜂鸣器                 → PB1  （GPIO 输出，低电平触发）
+  补光灯 LED             → PA5  （GPIO 输出，低电平触发）
+  浇灌水泵继电器         → PA7  （GPIO 输出，低电平触发）
+  散热风扇继电器         → PC1  （GPIO 输出，低电平触发）
+
+【通信模块】
+  USART1（PA9/PA10）     → 串口屏 UI，波特率 115200，接收手动控制命令
+  USART2（PA2/PA3）      → 备用串口，波特率 9600
+  USART6（PC6/PC7）      → ESP32 WiFi 模块，波特率 115200，双向 JSON 通信
+
+
+三、STM32CubeMX 工程配置步骤
+------------------------------------------------------------------------
+1. 新建工程，选型 STM32F401RCTx，生成 STM32CubeIDE 项目结构。
+
+2. 时钟配置：
+   - 使用外部 HSE 晶振（8MHz），PLL 倍频至 84MHz 系统时钟。
+   - APB1 = 42MHz，APB2 = 84MHz。
+
+3. GPIO 配置：
+   - PB0   → GPIO_Input，Pull-up（按键）
+   - PB1   → GPIO_Output，初始高电平（蜂鸣器关）
+   - PA5   → GPIO_Output，初始高电平（补光灯关）
+   - PA7   → GPIO_Output，初始高电平（水泵关）
+   - PC1   → GPIO_Output，初始高电平（风扇关）
+   - PB5   → GPIO_Output（DHT11 单总线，代码动态切换输入/输出方向）
+   - PB6   → GPIO_Output（OLED SCL 软 I2C）
+   - PB7   → GPIO_Output（OLED SDA 软 I2C）
+
+4. ADC1 配置：
+   - Channel 0（PA0）：光照传感器，单次转换
+   - Channel 6（PA6）：土壤湿度传感器，单次转换
+   - 分辨率 12 位，右对齐
+
+5. TIM1 配置（舵机 PWM）：
+   - 预分频 PSC = 167（84MHz / 168 = 500kHz）
+   - 自动重载 ARR = 9999（500kHz / 10000 = 50Hz）
+   - Channel 1（PA8）→ PWM Generation CH1
+   - 脉宽占空比换算：0° = 500µs = CCR 250；90° = 1500µs = CCR 750；180° = 2500µs = CCR 1250
+
+6. TIM2 配置：
+   - 基础定时器，PSC = 71（84MHz / 72 = 1MHz），ARR = 65535
+   - 用于 DHT11 时序的微秒级精确延迟
+
+7. USART 配置：
+   - USART1：异步，115200，8N1，仅开启接收中断（RXNE）
+   - USART2：异步，9600，8N1
+   - USART6：异步，115200，8N1，开启接收中断
+
+8. FreeRTOS 配置（CMSIS-OS v1）：
+   - 开启 FreeRTOS，选择 CMSIS_V1 接口
+   - 创建以下任务（Task）：
+       ADCTask    优先级 24（osPriorityRealtime）  传感器采集
+       SWCTask    优先级 10（osPriorityAboveNormal）自动控制逻辑
+       OledTask   优先级  8（osPriorityNormal）     OLED 显示刷新
+       AITask     优先级  7（osPriorityNormal）      AI 推理 + 告警
+       ComTask    优先级  5（osPriorityBelowNormal） ESP32 数据上报
+   - 每个任务栈大小 256 word（1KB），如 AI 任务需增大至 512 word
+
+9. 生成代码：选择 "Generate peripheral initialization as pair of .c/.h files"，
+   点击 "Generate Code"。
+
+
+四、第三方驱动移植
+------------------------------------------------------------------------
+1. DHT11 驱动（dht11.c / dht11.h）
+   - 将驱动文件放入 Hardware/DHT11/ 目录
+   - 在 dht11.h 中定义引脚：
+       #define DHT11_GPIO_PORT  GPIOB
+       #define DHT11_GPIO_PIN   GPIO_PIN_5
+   - 驱动依赖 TIM2 实现微秒延时（us_delay 函数）
+   - 注意：返回值类型须与全局变量类型（float/uint8_t）保持一致，
+     避免 volatile 类型不匹配警告
+
+2. OLED 驱动（OLED.c / OLED.h）
+   - 使用软件 I2C 模式，引脚 PB6（SCL）/ PB7（SDA）
+   - 将驱动放入 Hardware/ 目录，在 main.c 中引用头文件
+   - 初始化调用：OLED_Init()
+   - 显示刷新逻辑：每次刷新前 OLED_Clear()，写入数据后 OLED_Update()
+
+3. 随机森林 AI 模型（random_forest.h）
+   - 由 Python sklearn 训练后，转换为 C 头文件格式
+   - 嵌入式推理函数原型：int predict(float temp, float humi, float soil, float light)
+   - 四分类输出：0=正常 / 1=光照异常 / 2=温度异常 / 3=缺水
+   - 注意：头文件中不能有嵌套注释（/* 内嵌 /* */ */），否则编译报错
+   - 建议在 AITask 任务中单独调用，避免阻塞其他任务
+
+
+五、main.c 核心代码结构说明
+------------------------------------------------------------------------
+【全局变量（带 volatile 修饰，多任务共享）】
+  volatile float g_temp, g_humi;   // 温湿度
+  volatile int   g_soil;           // 土壤湿度（%）
+  volatile float g_voltage;        // 光照 ADC 电压
+  volatile int   g_light;          // 光照（lux 换算值）
+  volatile int   g_ai_result;      // AI 分类结果（0~3）
+  volatile uint8_t auto_mode;      // 1=自动模式，0=手动模式
+  volatile uint8_t display_mode;   // OLED 页面索引（0~3）
+  volatile uint8_t buzzer_state;   // 蜂鸣器状态
+  volatile uint8_t fan_state;      // 风扇状态
+  volatile uint8_t bulb_state;     // 补光灯状态
+  volatile uint8_t pump_state;     // 水泵状态
+
+【TIM1 PWM 引脚初始化（重要！）】
+  MX_TIM1_Init() 内必须调用：
+    HAL_TIM_MspPostInit(&htim1);  // 配置 PA8 为 TIM1_CH1 复用功能
+  缺少此行则 PA8 不输出 PWM，舵机无法工作。
+  由于该函数定义在 main.c 末尾，调用前需添加前向声明：
+    void HAL_TIM_MspPostInit(TIM_HandleTypeDef* htim);
+
+【FreeRTOS 任务实现要点】
+  - 所有任务延时必须使用 osDelay() 而非 HAL_Delay()
+    原因：HAL_Delay() 是忙等（轮询 uwTick），不释放 CPU，
+    会导致低优先级任务（如 OledTask）被持续抢占而饥饿冻结
+  - OledTask：不使用信号量，直接读全局变量，osDelay(20) 控制约 50fps 刷新
+  - ADCTask：每 500ms 采集一次，采用 HAL_ADC_PollForConversion 方式
+  - SWCTask：每 1000ms 执行一次自动控制判断
+  - AITask ：每 3000ms 执行一次 AI 推理
+  - ComTask：每 2000ms 向 ESP32（USART6）发送一次 JSON 上报包
+
+【按键消抖（Key_Scan 函数）】
+  使用静态变量 key_up 实现单次检测，消抖延迟必须用 osDelay(20)：
+    if (key_up && GPIO_PIN_RESET == HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_0)) {
+        osDelay(20);           // ← 必须用 osDelay，不能用 HAL_Delay
+        if (GPIO_PIN_RESET == HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_0)) {
+            key_up = 0;
+            return 1;
+        }
+    }
+
+【串口命令解析（USART1 接收中断）】
+  在 HAL_UART_RxCpltCallback 中累积字节，检测 '\n' 作为帧尾。
+  支持命令：
+    ON / OFF        → 切换自动/手动模式
+    AO / AF         → 风扇 开/关
+    BO / BF         → 补光灯 开/关（低电平触发：开=RESET，关=SET）
+    CO / CF         → 水泵 开/关（低电平触发：开=RESET，关=SET）
+    SERVO_0/90/180  → 舵机角度控制
+    BUZZER          → 触发蜂鸣器
+    BZOFF           → 停止蜂鸣器
+
+【ESP32 上报 JSON 格式（USART6 每 2s 发送）】
+  {"temp":25.30,"humi":68.50,"soil":45,"light":1200,"ai":0}\r\n
+
+
+六、调试中遇到的典型问题与解决方法
+------------------------------------------------------------------------
+问题 1：编译报错 "HAL_TIM_MspPostInit declared implicitly"
+  原因：函数在第 549 行被调用，但定义在文件末尾（第 923 行），
+        C 语言中需要提前声明函数原型。
+  解决：在 main.c 顶部（include 区域后）添加前向声明：
+        void HAL_TIM_MspPostInit(TIM_HandleTypeDef* htim);
+
+问题 2：random_forest.h 编译报错（嵌套注释）
+  原因：Python 自动生成的头文件中存在 /* … /* 内嵌注释 */ … */ 结构，
+        C 编译器不支持嵌套块注释。
+  解决：将内层注释 /* */ 改为行注释 //，或删除多余注释。
+
+问题 3：DHT11 温湿度读取返回异常值（0 或 255）
+  原因：volatile 类型不匹配，驱动返回 uint8_t 赋给 float 全局变量时
+        编译器警告并可能产生截断。
+  解决：在 dht11.h 中将返回值类型改为 float，或在赋值时显式强制转换。
+
+问题 4：OLED 复位后几秒内正常，随后冻结、数据不更新、按键无响应
+  原因：Key_Scan() 中使用 HAL_Delay(20) 忙等，ADCTask（优先级 24）和
+        SWCTask（优先级 10）周期性抢占时，OledTask（优先级 8）在
+        HAL_Delay 期间被连续剥夺 CPU，累积饥饿导致任务卡死。
+  解决：将 Key_Scan() 内所有 HAL_Delay() 改为 osDelay()；
+        OledTask 循环延迟由 osDelay(50) 改为 osDelay(20)。
+
+问题 5：舵机无法动作，始终保持初始位置
+  原因：MX_TIM1_Init() 中缺少 HAL_TIM_MspPostInit(&htim1) 调用，
+        PA8 引脚未被配置为 TIM1_CH1 复用功能模式，无 PWM 输出。
+  解决：在 MX_TIM1_Init() 函数末尾补充调用该函数。
+
+问题 6：补光灯 BO/BF 命令效果与预期相反
+  原因：代码中 BO（开）写的是 GPIO_PIN_SET（高电平=关），
+        BF（关）写的是 GPIO_PIN_RESET（低电平=开），逻辑颠倒。
+  解决：补光灯为低电平触发，BO 应写 GPIO_PIN_RESET，BF 写 GPIO_PIN_SET；
+        水泵 CO/CF 同理。
+
+问题 7：计数信号量导致 OledTask 阻塞（早期版本）
+  原因：原设计用 max=2 的计数信号量在传感器任务和 OledTask 之间同步，
+        ComTask 和 OledTask 同为消费者导致信号量永远饱和，
+        传感器任务 Release 失败，整个采集链路阻塞。
+  解决：OledTask 移除信号量机制，改为直接读 volatile 全局变量，
+        由 osDelay(20) 控制刷新节奏，ComTask 同样改为定时发送。
+
+
+七、最终功能验证清单
+------------------------------------------------------------------------
+  [ ] OLED 上电后显示温湿度，按 OB0 键循环切换 4 页
+  [ ] 温度 / 湿度 / 土壤湿度 / 光照数值实时刷新（不冻结）
+  [ ] 光照低于阈值时补光灯自动亮起，高于阈值自动熄灭
+  [ ] 温度超过 30°C 时风扇自动启动
+  [ ] 土壤湿度低于阈值时水泵自动浇水
+  [ ] 光照过强时舵机转动遮阳（0°/90°/180°三档）
+  [ ] AI 模块检测到异常时蜂鸣器报警，OLED 第 4 页显示异常类型
+  [ ] 串口 UI 发送 ON/OFF 切换手动/自动模式
+  [ ] 手动模式下 AO/AF/BO/BF/CO/CF/SERVO_x/BUZZER/BZOFF 命令均有效
+  [ ] USART6 每 2 秒向 ESP32 发送一次 JSON 数据包
+
+================================================================
+（本文档由 AI 辅助生成，结合实际调试记录整理，仅供参考）
+================================================================

@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>WIFE设备实时数据看板</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body class="bg-gray-900 text-white p-6">
+<div class="max-w-6xl mx-auto">
+    <h1 class="text-3xl font-bold text-center mb-6">🌿 WIFE 设备实时监测</h1>
+
+    <div class="flex justify-between bg-gray-800 p-3 rounded mb-4">
+        <div id="status">加载中</div>
+        <div id="time"></div>
+    </div>
+
+    <div class="grid grid-cols-4 gap-4 mb-6">
+        <div class="bg-gray-800 p-4 rounded-xl text-center">
+            <h3 class="text-gray-400">DHT11 温度(DHT11_T)</h3>
+            <p class="text-3xl text-red-500" id="t">-- ℃</p>
+        </div>
+        <div class="bg-gray-800 p-4 rounded-xl text-center">
+            <h3 class="text-gray-400">DHT11 湿度(DHT11_H)</h3>
+            <p class="text-3xl text-blue-400" id="h">-- %</p>
+        </div>
+        <div class="bg-gray-800 p-4 rounded-xl text-center">
+            <h3 class="text-gray-400">ADC 湿度(ADC_H)</h3>
+            <p class="text-3xl text-purple-400" id="ah">-- %</p>
+        </div>
+        <div class="bg-gray-800 p-4 rounded-xl text-center">
+            <h3 class="text-gray-400">光照强度(ADCL)</h3>
+            <p class="text-3xl text-yellow-400" id="light">-- lx</p>
+        </div>
+    </div>
+
+    <div class="bg-gray-800 p-5 rounded-xl">
+        <canvas id="chart" height="250"></canvas>
+    </div>
+</div>
+
+<script>
+let chart;
+let maxPoints = 20;
+// 和平台完全一致
+let cache = {DHT11_T:null,DHT11_H:null,ADC_H:null,ADCL:null};
+
+function initChart(){
+    const ctx = document.getElementById('chart').getContext('2d');
+    chart = new Chart(ctx,{
+        type:'line',
+        data:{
+            labels:[],
+            datasets:[
+                {label:'温度℃',data:[],borderColor:'#ef4444',tension:0.3},
+                {label:'DHT湿度%',data:[],borderColor:'#3b82f6',tension:0.3},
+                {label:'ADC湿度%',data:[],borderColor:'#a855f7',tension:0.3},
+                {label:'光照lx',data:[],borderColor:'#f59e0b',tension:0.3}
+            ]
+        },
+        options:{responsive:true,maintainAspectRatio:false}
+    })
+}
+function updateTime(){
+    document.getElementById('time').innerText = new Date().toLocaleString();
+}
+
+async function refresh(){
+    try{
+        let res = await fetch("http://127.0.0.1:5000/getdata");
+        let raw = await res.json();
+        console.log("后端返回",raw);
+        if(raw.code === 0 && raw.data.length>0){
+            raw.data.forEach(item=>{
+                cache[item.identifier] = parseFloat(item.value);
+            })
+            document.getElementById('t').innerText = cache.DHT11_T.toFixed(1)+" ℃";
+            document.getElementById('h').innerText = cache.DHT11_H.toFixed(1)+" %";
+            document.getElementById('ah').innerText = cache.ADC_H.toFixed(1)+" %";
+            document.getElementById('light').innerText = cache.ADCL.toFixed(0)+" lx";
+            document.getElementById('status').innerText = "✅ 读取OneNET云端真实数据";
+            document.getElementById('status').className = "text-green-400";
+            let now = new Date().toLocaleTimeString();
+            chart.data.labels.push(now);
+            chart.data.datasets[0].data.push(cache.DHT11_T);
+            chart.data.datasets[1].data.push(cache.DHT11_H);
+            chart.data.datasets[2].data.push(cache.ADC_H);
+            chart.data.datasets[3].data.push(cache.ADCL);
+            if(chart.data.labels.length>maxPoints){
+                chart.data.labels.shift();
+                chart.data.datasets.forEach(d=>d.data.shift());
+            }
+            chart.update();
+        }else{
+            document.getElementById('status').innerText = "⏳ 云端暂无上报数据";
+            document.getElementById('status').className = "text-yellow-400";
+        }
+    }catch(e){
+        document.getElementById('status').innerText = "❌ 请求异常";
+        document.getElementById('status').className = "text-red-400";
+        console.error(e);
+    }
+    updateTime();
+}
+
+window.onload = ()=>{
+    initChart();
+    refresh();
+    setInterval(refresh,1500);
+}
+</script>
+</body>
+</html>
